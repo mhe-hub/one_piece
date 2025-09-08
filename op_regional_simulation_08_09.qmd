@@ -1,0 +1,323 @@
+---
+title: "One Piece Regional Simulation"
+format: html
+editor: visual
+---
+
+# **Abstract**
+
+This document outlines a Monte Carlo simulation designed to model and analyze the competitive metagame of the One Piece Card Game. By leveraging empirical matchup win-rate data and leader play-rate statistics, the model simulates a large number of multi-stage tournaments to determine the probabilistic performance of various archetypes. The objective is to produce robust metrics, including Swiss round win rates, Top 32 playoff conversion rates, and overall tournament win rates, thereby offering insights into the metagame's structure beyond the scope of single-event results.
+
+### **1. Methodology**
+
+The simulation is constructed in the R programming language, utilizing several packages from the Tidyverse ecosystem for data manipulation and visualization. The methodology is divided into two phases: data preparation and simulation design.
+
+#### **1.1 Data Preparation**
+
+The model is predicated on two primary datasets:
+
+1.  **Matchup Win Rates**: Comprehensive matrices detailing the win probability for each leader archetype against every other. These matrices are further refined to distinguish between outcomes where a player goes first versus second, a critical variable in the game's dynamics.
+
+2.  **Leader Play Rates**: The observed frequency of each leader within the competitive field. This data is used to construct a representative player population for each simulated tournament.
+
+The following R code block handles the loading, cleaning, and preparation of this foundational data.
+
+```{r setup}
+#| root.dir: "C:/Users/march/Desktop/Projekte/one_piece_meta/pics_data"
+#| include: false
+# Load our toolkit of R packages
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggrepel)
+library(forcats)
+library(parallel)
+library(foreach)
+library(doParallel)
+
+set.seed(123)
+
+
+```
+
+```{r}
+# Load data using relative paths
+df_first_raw <- read.csv("pics_data/winrates_first.csv", stringsAsFactors = FALSE, check.names = FALSE)
+df_second_raw <- read.csv("pics_data/winrates_second.csv", stringsAsFactors = FALSE, check.names = FALSE)
+
+# Sync leader names
+df_second_raw[, 1] <- df_first_raw[, 1]
+
+# Function to prepare win rate matrices
+prepare_matrix <- function(df_raw, player_names) {
+  colnames(df_raw)[-1] <- player_names
+  win_rate_cols <- df_raw[, -1]
+  win_rate_matrix <- as.matrix(sapply(win_rate_cols, function(x) as.numeric(gsub("[^0-9.]", "", x))))
+  rownames(win_rate_matrix) <- player_names
+  colnames(win_rate_matrix) <- player_names
+  return(win_rate_matrix / 100.0)
+}
+
+# Create final win-rate matrices
+leaders <- df_first_raw[, 1]
+win_matrix_first <- prepare_matrix(df_first_raw, leaders)
+win_matrix_second <- prepare_matrix(df_second_raw, leaders)
+
+# Define and normalize play rates
+playrate_df <- data.frame(
+  Leader = leaders,
+  Playrate = c(12.7, 11.4, 10.9, 8.7, 7.2, 5.5, 5.4, 4.1, 4.1, 3.4, 2.3, 2.0, 2.0, 1.6)
+)
+initial_probabilities <- playrate_df$Playrate / sum(playrate_df$Playrate)
+
+# METHOD 2: Use even playrates for a power-level analysis
+#num_leaders <- length(leaders)
+#initial_probabilities <- rep(1/num_leaders, num_leaders)
+
+#playrate_df$Playrate <- (1 / num_leaders) * 100
+
+```
+
+## **1.2 Simulation Design**
+
+The simulation models a series of large-scale tournaments. Each event consists of two stages: a multi-round Swiss stage followed by a single-elimination playoff.
+
+-   **Parameters**: The simulation consists of 1,000 tournaments, each with 1,024 competing agents. The number of Swiss rounds is 10, determined by `log2(1024)`.
+
+-   **Swiss Stage**: Agents are paired against opponents with identical or similar win-loss records. Match outcomes are determined probabilistically based on the matchup-specific win rates from the prepared matrices.
+
+-   **Playoff Stage**: The top 32 agents from the Swiss stage advance to a single-elimination, best-of-three playoff bracket. Seeding is based on Swiss round performance. For each best-of-three match, the higher-seeded agent chooses to play first or second in the first game, making the statistically optimal decision based on the matchup. In subsequent games within the same match, the loser of the previous game is granted this choice.
+
+```{r}
+## --- Vectorized function to simulate Swiss rounds ---
+run_swiss_rounds <- function(agents, num_rounds, win_m1, win_m2) {
+  for (round_j in 1:num_rounds) {
+    agents <- agents[order(agents$Wins, decreasing = TRUE, sample(nrow(agents))), ]
+    
+    p1_indices <- seq(1, nrow(agents), by = 2)
+    p2_indices <- seq(2, nrow(agents), by = 2)
+    
+    decks1 <- agents$Deck[p1_indices]
+    decks2 <- agents$Deck[p2_indices]
+    
+    p1_goes_first <- runif(length(p1_indices)) > 0.5
+    
+    wr1 <- win_m1[cbind(decks1, decks2)]
+    wr2 <- win_m2[cbind(decks1, decks2)]
+    
+    win_rates_p1 <- ifelse(p1_goes_first, wr1, wr2)
+    p1_wins <- runif(length(p1_indices)) <= win_rates_p1
+    
+    agents$Wins[p1_indices] <- agents$Wins[p1_indices] + p1_wins
+    agents$Losses[p1_indices] <- agents$Losses[p1_indices] + !p1_wins
+    agents$Wins[p2_indices] <- agents$Wins[p2_indices] + !p1_wins
+    agents$Losses[p2_indices] <- agents$Losses[p2_indices] + p1_wins
+  }
+  return(agents)
+}
+
+
+play_bo3_match <- function(player_H, player_L, win_m1, win_m2) {
+  wins_H <- 0; wins_L <- 0
+  chooser <- "H" 
+
+  while (wins_H < 2 && wins_L < 2) {
+    deck_H <- player_H$Deck; deck_L <- player_L$Deck
+    if (chooser == "H") {
+      wr_first <- win_m1[deck_H, deck_L]; wr_second <- win_m2[deck_H, deck_L]
+      game_wr <- if (wr_first >= wr_second) wr_first else wr_second
+    } else { 
+      wr_first <- win_m1[deck_L, deck_H]; wr_second <- win_m2[deck_L, deck_H]
+      game_wr <- if (wr_first >= wr_second) 1 - wr_first else 1 - wr_second
+    }
+    if (runif(1) <= game_wr) {
+      wins_H <- wins_H + 1; chooser <- "L"
+    } else {
+      wins_L <- wins_L + 1; chooser <- "H"
+    }
+  }
+  return(if (wins_H == 2) player_H else player_L)
+}
+
+run_playoffs <- function(swiss_results, win_m1, win_m2) {
+    top_32_players <- swiss_results %>%
+    slice_max(order_by = Wins, n = 32, with_ties = FALSE) %>%
+    mutate(Seed = 1:32)
+    
+    playoff_round <- top_32_players
+    while (nrow(playoff_round) > 1) {
+        winners <- list()
+        num_matches <- nrow(playoff_round) / 2
+        for (i in 1:num_matches) {
+            player_H <- playoff_round[i, ]; player_L <- playoff_round[nrow(playoff_round) - i + 1, ]
+            winners[[i]] <- play_bo3_match(player_H, player_L, win_m1, win_m2)
+        }
+        playoff_round <- do.call(rbind, winners)
+    }
+    return(playoff_round)
+}
+```
+
+### **2. Simulation Execution**
+
+The main simulation loop iterates through the specified number of tournaments, executing the Swiss and playoff stages for each. Agent data and final tournament winners are aggregated for subsequent analysis.
+
+```{r}
+# --- Simulation Parameters ---
+N_AGENTS <- 1024
+N_TOURNAMENTS <- 5000
+N_ROUNDS <- log2(N_AGENTS)
+PLAYRATE_VARIANCE <- 0.20 # A knob to control variance. 0.20 = +/- 20% noise.
+
+# --- SETUP PARALLEL PROCESSING ---
+num_cores <- detectCores() - 1
+registerDoParallel(cores = num_cores)
+cat(paste("\n--- Starting Parallel Simulation on", num_cores, "CPU cores ---\n"))
+
+# --- Main Tournament Loop ---
+results_list <- foreach(
+  tourney_i = 1:N_TOURNAMENTS, 
+  .packages = 'dplyr'
+) %dopar% {
+  
+  # Add random noise based on the variance parameter
+  noise <- rnorm(length(initial_probabilities), mean = 1, sd = PLAYRATE_VARIANCE)
+  temp_probabilities <- initial_probabilities * noise
+  
+  # Ensure no negative probabilities and re-normalize so they sum to 1
+  temp_probabilities[temp_probabilities < 0] <- 0
+  temp_probabilities <- temp_probabilities / sum(temp_probabilities)
+  
+  # Initialize agents using the new temporary probabilities
+  agents <- data.frame(
+    Deck = sample(leaders, N_AGENTS, replace = TRUE, prob = temp_probabilities),
+    Wins = 0, Losses = 0
+  )
+  
+  # Run Swiss rounds and playoffs as before...
+  swiss_results <- run_swiss_rounds(agents, N_ROUNDS, win_matrix_first, win_matrix_second)
+  swiss_results$Tournament_ID <- tourney_i
+  
+  return(swiss_results)
+}
+
+# Stop the parallel cluster
+stopImplicitCluster()
+cat("--- Simulation Complete ---\n")
+
+
+# Combine all results into a single, large data frame
+all_tournament_data <- bind_rows(results_list)
+
+# Now, calculate the winners from the full dataset
+tournament_winners <- all_tournament_data %>%
+  group_by(Tournament_ID) %>%
+  group_modify(~ run_playoffs(., win_matrix_first, win_matrix_second)) %>%
+  ungroup() %>%
+  pull(Deck)
+```
+
+## **3. Results and Analysis**
+
+Upon completion of the simulations, the aggregated data is processed to derive key performance indicators for each leader archetype. The primary metrics are:
+
+-   **Swiss Win Rate**: The aggregate game win percentage across all Swiss rounds.
+
+-   **Top 32 Conversion Rate**: The frequency with which an archetype qualifies for the playoff stage, normalized by its total representation. This metric evaluates consistency and performance under pressure.
+
+-   **Tournament Win Rate**: The percentage of total simulated tournaments won by an archetype, representing the ultimate measure of success.
+
+```{r}
+# --- Full Data Analysis ---
+swiss_performance <- all_tournament_data %>%
+  group_by(Deck) %>%
+  summarise(Swiss_Win_Rate = sum(Wins) / (sum(Wins) + sum(Losses)))
+
+top_32_finishers <- all_tournament_data %>%
+  group_by(Tournament_ID) %>%
+  slice_max(order_by = Wins, n = 32, with_ties = FALSE) %>%
+  ungroup() %>%
+  group_by(Deck) %>%
+  summarise(Top_32_Finishes = n())
+
+winner_summary <- as.data.frame(table(tournament_winners))
+colnames(winner_summary) <- c("Deck", "Tournament_Wins")
+
+final_report <- playrate_df %>%
+  left_join(swiss_performance, by = c("Leader" = "Deck")) %>%
+  left_join(top_32_finishers, by = c("Leader" = "Deck")) %>%
+  left_join(winner_summary, by = c("Leader" = "Deck")) %>%
+  mutate(across(where(is.numeric), ~replace_na(., 0))) %>%
+  mutate(
+    Short_Name = gsub(" ", "_", Leader),
+    Total_Played = round(initial_probabilities * N_AGENTS * N_TOURNAMENTS),
+    Top_32_Conversion_Rate = Top_32_Finishes / Total_Played,
+    Tournament_Win_Rate = Tournament_Wins / N_TOURNAMENTS,
+    Win_Conversion_Rate = Tournament_Wins / Total_Played
+  ) %>%
+  select(Leader, Short_Name, Playrate, Swiss_Win_Rate, Top_32_Conversion_Rate, Tournament_Win_Rate, Win_Conversion_Rate)
+
+knitr::kable(final_report %>% arrange(desc(Tournament_Win_Rate)),
+             caption = "Final Leader Performance Report",
+             digits = 4)
+```
+
+## **4. Visualizations**
+
+The calculated metrics are visualized to facilitate interpretation. The following plots illustrate the primary findings of the simulation.
+
+```{r}
+# --- Define a reusable theme for the bar charts ---
+bar_chart_theme <- theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+    plot.title = element_text(face = "bold", size = 18),
+    plot.subtitle = element_text(size = 12, color = "gray40"),
+    plot.margin = margin(10, 10, 10, 10)
+  )
+
+# Plot 1: Overall Tournament Win Rate
+plot1 <- ggplot(final_report, aes(x = reorder(Short_Name, -Tournament_Win_Rate), y = Tournament_Win_Rate * 100)) +
+  geom_bar(stat = "identity", fill = "#4E79A7") +
+  labs(title = "Overall Tournament Win Rate",
+       subtitle = paste("Based on", N_TOURNAMENTS, "simulated events"),
+       x = NULL, y = "Win Rate (%)") +
+  bar_chart_theme
+
+# Plot 2: Play Rate vs. Swiss Performance
+plot2 <- ggplot(final_report, aes(x = Playrate, y = Swiss_Win_Rate * 100)) +
+  geom_hline(yintercept = 50, linetype = "dashed", color = "red", alpha = 0.8) +
+  geom_point(aes(color = Leader), size = 5, alpha = 0.8) +
+  geom_text_repel(aes(label = Short_Name), size = 4, max.overlaps = Inf, box.padding = 0.5) +
+  theme_minimal(base_size = 14) +
+  labs(title = "Popularity vs. Performance",
+       subtitle = "Swiss Round Win Rate vs. Initial Play Rate",
+       x = "Initial Play Rate (%)", y = "Swiss Win Rate (%)") +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 18),
+        plot.subtitle = element_text(size = 12, color = "gray40"))
+
+# Plot 3: Top 32 Conversion Rate
+plot3 <- ggplot(final_report, aes(x = reorder(Short_Name, -Top_32_Conversion_Rate), y = Top_32_Conversion_Rate * 100)) +
+  geom_bar(stat = "identity", fill = "#59A14F") +
+  labs(title = "Top 32 Conversion Rate",
+       subtitle = "Likelihood of making the playoff cut",
+       x = "Leader", y = "Conversion Rate (%)") +
+  bar_chart_theme
+
+# Plot 4: Player-level Win Conversion Rate
+plot4 <- ggplot(final_report, aes(x = reorder(Short_Name, -Win_Conversion_Rate), y = Win_Conversion_Rate * 100)) +
+  geom_bar(stat = "identity", fill = "#E15759") +
+  labs(title = "Player Win Conversion Rate",
+       subtitle = "Probability of winning the tournament given deck choice",
+       x = "Leader", y = "Win Conversion Rate (%)") +
+  bar_chart_theme
+
+# --- Display and save each plot ---
+print(plot1); print(plot2); print(plot3); print(plot4)
+ggsave("tournament_win_rate.png", plot1, width = 11, height = 7, dpi = 150)
+ggsave("popularity_vs_performance.png", plot2, width = 11, height = 7, dpi = 150)
+ggsave("top32_conversion_rate.png", plot3, width = 11, height = 7, dpi = 150)
+ggsave("win_conversion_rate.png", plot4, width = 11, height = 7, dpi = 150)
+```
